@@ -1,115 +1,302 @@
-// Copyright (c) 2016, J. Salvador Arias <jsalarias@gmail.com>
+// Copyright (c) 2017, J. Salvador Arias <jsalarias@gmail.com>
 // All rights reserved.
 // Distributed under BSD2 license that can be found in the LICENSE file.
 
-// Package stanza reads and writes record-jar/stanza files as described by
-// E.S. Raymond, "The Art of Unix Programming", Chapter 5.
+// Package stanza reads and writes records in a list ('stanza') format.
 //
-// A stanza file comprise multi-line records made up key/value pairs of the
-// form:
-//	key: value
-// Each line contains an key/value pair. Long values may be folded over
-// multiple lines, provided that each continuation line starts with one or
-// more spaces.
+// Stanza files have the following format:
+//	1- Each line containing a field must starts with the field name and
+//	   separated from its content by ':' character. If the field name
+//	   ends with a new line rather than ':', the field is considered as
+//	   empty.
+//	2- Field names are case insensitive (always read as lower caps),
+//	   without spaces, and should be unique.
+//	3- A field ends with a new line. If the content of the field extends
+//	   more than one line, the next line should start with at least one
+//	   space or tab character.
+//	4- A record ends with a line that start with '%' character. Any
+//	   character after '%' will be ignored (Usually "%%" is used to
+//	   increase visibility of end-of-record).
+//	5- Lines starting with '#' are taken as comments.
+//	6- Empty lines are ignored.
 //
-// Record delimiter is a line consisting of "%%\n".
-//
-// Blank lines, or lines cosisting only of whitespaces are ignored.
-//
-// Lines starting with # are comments.
-//
-// An example is:
-//	ISO3166-2: AR-C
-//	Name:      Ciudad Autónoma de Buenos Aires
-//	Category:  City
+// An example of a stanza list is:
+//	# Country data facts
+//	name:	República Argentina
+//	common:	Argentina
+//	iso3166: AR
+//	capital: Buenos Aires
+//	population: 42669500
+//	anthem:	Ya su trono dignísimo abrieron
+//		las Provincias Unidas del Sud
+//		y los libres del mundo responden:
+//		"¡Al gran pueblo argentino, salud!"
 //	%%
-//	ISO3166-2: AR-B
-//	Name:      Buenos Aires
-//	Category:  Province
+//	name:	대한민국
+//	common:	South Korea
+//	iso3166: KR
+//	capital: Seoul
+//	population: 51302044
+//	anthem:	무궁화 삼천리 화려강산
+//		대한 사람, 대한으로 길이 보전하세
 //	%%
-//	ISO3166-2: AR-K
-//	Name:      Catamarca
-//	Category:  Province
+//	name:	中华人民共和国
+//	common:	China
+//	iso3166: CN
+//	capital: Beijing
+//	population: 1339724852
 //	%%
-//	ISO3166-2: AR-H
-//	Name:      Chaco
-//	Category:  Province
+//	name:	Росси́я
+//	common:	Russia
+//	iso3166: RU
+//	capital: Moscow
+//	population: 144192450
+//	anthem: Славься, Отечество наше свободное,
+//		Братских народов союз вековой,
+//		Предками данная мудрость народная!
+//		Славься, страна! Мы гордимся тобой!
 //	%%
+//
+// Stanza file format are inspired by the record-jar/stanza format described
+// by E. Raymond "The Art of UNIX programming" (2003) Addison-Wesley
+// (<http://www.catb.org/esr/writings/taoup/html/ch05s02.html#id2906931>), and
+// C. Strozzi NoSQL list format (2007)
+// (<http://www.strozzi.it/cgi-bin/CSA/tw7/I/en_US/NoSQL/Table%20structure>).
 package stanza
 
 import (
 	"bufio"
 	"bytes"
-	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"unicode"
+
+	"github.com/pkg/errors"
 )
 
-// A Record is a map of string keys to string values. The keys are
-// case-insensitive.
-type Record map[string]string
-
-// Set sets the key to value. It replaces any existing value.
-func (r Record) Set(key, value string) {
-	r[strings.ToLower(key)] = value
-}
-
-// Get gets the value associated with the given key. If there is no value
-// associated with the key, Get returns the empty string.
-func (r Record) Get(key string) string {
-	if r == nil {
-		return ""
-	}
-	v, ok := r[strings.ToLower(key)]
-	if !ok {
-		return ""
-	}
-	return v
-}
-
-// A Reader reads records from a record-jar/stanza encoded file.
+// A Reader reads records from a stanza-encoded file.
 type Reader struct {
-	keys  []string
-	line  int
-	r     *bufio.Reader
-	field bytes.Buffer
+	line   int
+	fields []string        // sorted list of fields
+	fok    map[string]bool // list of present fields
+	r      *bufio.Reader
+	b      *bytes.Buffer
 }
 
 // NewReader returns a new Reader that reads from r.
 func NewReader(r io.Reader) *Reader {
-	return &Reader{r: bufio.NewReader(r)}
+	return &Reader{
+		line: 1,
+		fok:  make(map[string]bool),
+		r:    bufio.NewReader(r),
+		b:    &bytes.Buffer{},
+	}
 }
 
-// Read reads one record from r.
-func (r *Reader) Read() (record Record, err error) {
+// Fields returns a sorted list of all the fields read until the last read
+// call. The caller should not modify this slice.
+func (r *Reader) Fields() []string {
+	return r.fields
+}
+
+// Read reads one record from r. The record is a map in which each entry
+// represents the content of the field indicated by the key. The returned map
+// is owned by the caller.
+func (r *Reader) Read() (record map[string]string, err error) {
 	for {
 		record, err = r.parseRecord()
-		if len(record) != 0 {
+		if err != nil {
+			return nil, errors.Wrap(err, "stanza: Read")
+		}
+		if record == nil {
+			continue
+		}
+		return record, nil
+	}
+}
+
+// parseRecord parses a single record.
+func (r *Reader) parseRecord() (record map[string]string, err error) {
+	record = make(map[string]string)
+	for {
+		f, delim, err := r.parseFieldName()
+		if err != nil {
+			if len(record) == 0 {
+				return nil, err
+			}
 			break
 		}
-		if err != nil {
-			if err != io.EOF {
-				err = fmt.Errorf("line %d: %v", err)
-			}
-			return nil, err
+		if delim == '\n' {
+			continue
 		}
+		if delim == '%' {
+			break
+		}
+		v, end := r.parseFieldValue()
+		if len(f) > 0 && len(v) > 0 {
+			if _, dup := record[f]; dup {
+				return nil, errors.Errorf("line: %d: duplicated field %q", r.line, f)
+			}
+			record[f] = v
+			if !r.fok[f] {
+				r.fok[f] = true
+				r.fields = append(r.fields, f)
+			}
+		}
+		if end {
+			break
+		}
+	}
+	if len(record) == 0 {
+		return nil, nil
 	}
 	return record, nil
 }
 
-// Keys returns the list of all keys read (in order of appareance while
-// reading). It is useful when we need to know the keys in order because
-// a map keys are returned in random order.
-func (r *Reader) Keys() []string {
-	return r.keys
+// parseFieldName parses a field name. Delim indicates the character at the
+// end of the field name.
+func (r *Reader) parseFieldName() (field string, delim rune, err error) {
+	// setup the reading of a field line: ignores lines starting with
+	// comments, and finish if on an end-of-record.
+	for {
+		r1, err := readRune(r.r)
+		if err != nil {
+			return "", 0, err
+		}
+		if !unicode.IsSpace(r1) {
+			if r1 == '#' {
+				skip(r.r, '\n') // skip comments
+				r.line++
+				continue
+			}
+			if r1 == '%' {
+				skip(r.r, '\n') // end-of-record
+				r.line++
+				return "", '%', nil
+			}
+			r.r.UnreadRune()
+			break
+		}
+		if r1 == '\n' {
+			r.line++
+		}
+	}
+
+	// reads the field name, stop at a colon (:), or with a new line
+	// (interpreted as an empty field).
+	r.b.Reset()
+	space := false
+	for {
+		r1, err := readRune(r.r)
+		if err != nil {
+			return "", 0, err
+		}
+		if r1 == ':' || r1 == '\n' {
+			if r1 == '\n' {
+				r.line++
+			}
+			delim = r1
+			break
+		}
+		if unicode.IsSpace(r1) {
+			space = true
+			continue
+		}
+		// replace spaces with '-' character
+		if space {
+			space = false
+			r.b.WriteRune('-')
+		}
+		r.b.WriteRune(r1)
+	}
+	return strings.ToLower(r.b.String()), delim, nil
 }
 
-// skip reads runes up to and including the rune delim or until error.
-func (r *Reader) skip(delim rune) error {
+// parseFieldValue parses the value of a field. End indicates that the end-of-
+// record was found, this can be either an explicit end of record ('%'
+// character) of an error.
+func (r *Reader) parseFieldValue() (value string, end bool) {
+	r.b.Reset()
+	space, first, line := false, true, false
 	for {
-		r1, _, err := r.r.ReadRune()
+		r1, err := readRune(r.r)
+		if err != nil {
+			end = true
+			break
+		}
+
+		// check the next line
+		if r1 == '\n' {
+			r.line++
+			space, line = false, true
+			r1, err = readRune(r.r)
+			if err != nil {
+				end = true
+				break
+			}
+			if r1 == '#' {
+				skip(r.r, '\n') // skip comments
+				r.line++
+				continue
+			}
+			if r1 == '%' {
+				end = true
+				skip(r.r, '\n') // end-of-record
+				r.line++
+				break
+			}
+			if r1 == '\n' {
+				r.r.UnreadRune() // make decision on next loop
+				continue
+			}
+			if unicode.IsSpace(r1) {
+				continue // multiline field
+			}
+			r.r.UnreadRune() // end-of-field
+			break
+		}
+		if unicode.IsSpace(r1) {
+			space = true
+			continue
+		}
+		if line {
+			r.b.WriteRune('\n')
+			space = false
+			line = false
+		}
+		if space {
+			if !first {
+				r.b.WriteRune(' ')
+			}
+			space = false
+		}
+		r.b.WriteRune(r1)
+		first = false
+	}
+	return r.b.String(), end
+}
+
+// readRune reads a rune, folding \r\n to \n.
+func readRune(r *bufio.Reader) (rune, error) {
+	r1, _, err := r.ReadRune()
+
+	// handle \r\n
+	if r1 == '\r' {
+		r1, _, err = r.ReadRune()
+		if err != nil {
+			if r1 != '\n' {
+				r.UnreadRune()
+				r1 = '\r'
+			}
+		}
+	}
+	return r1, err
+}
+
+// skip read runes up to and including the rune delim or until error.
+func skip(r *bufio.Reader, delim rune) error {
+	for {
+		r1, err := readRune(r)
 		if err != nil {
 			return err
 		}
@@ -117,172 +304,4 @@ func (r *Reader) skip(delim rune) error {
 			return nil
 		}
 	}
-}
-
-// parseRecord reads and parses a single record-jar/stanza record from r.
-func (r *Reader) parseRecord() (record Record, err error) {
-	record = Record{}
-	// check out for empty records, empty lines, or comment lines
-	for {
-		r.line++
-		r1, _, err := r.r.ReadRune()
-		if err != nil {
-			return nil, err
-		}
-		if r1 == '%' {
-			err = r.skip('\n')
-			if err != nil {
-				return nil, err
-			}
-			break
-		}
-		if r1 == '\n' {
-			continue
-		}
-		if r1 == '#' {
-			err = r.skip('\n')
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-		r.r.UnreadRune()
-		r.line--
-		break
-	}
-	for {
-		r.line++
-		key, err := r.parseKey()
-		if err != nil {
-			return nil, err
-		}
-		value, next, err := r.parseValue()
-		if err != nil {
-			return nil, err
-		}
-		if (len(value) != 0) && (len(key) != 0) {
-			nk := true
-			kv := strings.ToLower(key)
-			for _, k := range r.keys {
-				if kv == k {
-					nk = false
-					break
-				}
-			}
-			record.Set(key, value)
-			if nk {
-				r.keys = append(r.keys, kv)
-			}
-		}
-		if next == 0 {
-			break
-		}
-		if next == '%' {
-			r.line++
-			err = r.skip('\n')
-			if err != nil {
-				if len(record) == 0 {
-					return nil, err
-				}
-				break
-			}
-			break
-		}
-	}
-	return record, nil
-}
-
-// parseKey parses the key string.
-func (r *Reader) parseKey() (key string, err error) {
-	r.field.Reset()
-	for {
-		r1, _, err := r.r.ReadRune()
-		if err != nil {
-			return "", err
-		}
-		if unicode.IsSpace(r1) {
-			return "", errors.New("unexpected space in key field")
-		}
-		if r1 == ':' {
-			return r.field.String(), nil
-		}
-		r.field.WriteRune(r1)
-	}
-}
-
-// parseValue parses the value string. Next rune is the next valid rune.
-func (r *Reader) parseValue() (value string, next rune, err error) {
-	r.field.Reset()
-	space := false
-	first := true
-	nline := false
-	for {
-		r1, _, err := r.r.ReadRune()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return "", 0, err
-		}
-		if r1 == '\n' {
-			r1, _, err = r.r.ReadRune()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return "", 0, err
-			}
-			if r1 == '\n' {
-				r.line++
-				// unreads the ending '\n' so it can read the
-				// next line
-				r.r.UnreadRune()
-				continue
-			}
-			if r1 == '#' {
-				err = r.skip('\n')
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					return "", 0, err
-				}
-				// unreads the ending '\n' so it can read the
-				// next line
-				r.r.UnreadRune()
-				continue
-			}
-			if r1 == '%' {
-				next = r1
-				break
-			}
-			if unicode.IsSpace(r1) {
-				space = false
-				nline = true
-				continue
-			}
-			next = r1
-			r.r.UnreadRune()
-			break
-		}
-		if unicode.IsSpace(r1) {
-			if (!nline) && (!first) {
-				space = true
-			}
-			continue
-		}
-		if nline {
-			if !first {
-				r.field.WriteRune('\n')
-			}
-			nline = false
-		}
-		if space {
-			r.field.WriteRune(' ')
-			space = false
-		}
-		r.field.WriteRune(r1)
-		first = false
-	}
-	return r.field.String(), next, nil
 }
